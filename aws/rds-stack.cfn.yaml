@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS Stack with Aurora PostgreSQL Database (Serverless or Provisioned). (StackName expected to be in the format: <ProjectPrefix>-<ProjectId-Prefix>-<StageName>-rds-stack)'
+
+Parameters:
+
+  ProjectPrefix:
+    Description: 'Project prefix for resource names (without hyphen or StageName)'
+    Type: String
+    MinLength: 3
+    MaxLength: 10
+
+  ProjectId:
+    Description: 'A project specific UUID (ex: 317523a7-9837-41a5-9757-f83c7987e1c7)'
+    Type: String
+    MinLength: 36 # UUID str length
+
+  StageName:
+    Type: String
+    AllowedValues:
+    - prd
+    - dev
+    - stg
+
+  DeploymentMode:
+    Description: 'Choose between Serverless (v2) or Provisioned deployment mode'
+    Type: String
+    AllowedValues:
+      - Serverless
+      - Provisioned
+    Default: Serverless
+
+  DBName:
+    Description: 'Name of the database (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: String
+    Default: ''
+
+  DBMasterUsername:
+    Description: 'The master user name for the DB instance (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: 'String'
+    Default: postgres
+
+  # Serverless v2 Parameters
+  MaxCapacity:
+    Description: '[Serverless only] The maximum capacity units for a Serverless v2 Aurora cluster.'
+    Type: Number
+    MinValue: 0.5
+    MaxValue: 128
+    Default: 1
+
+  MinCapacity:
+    Description: '[Serverless only] The minimum capacity units for a Serverless v2 Aurora cluster.'
+    Type: Number
+    MinValue: 0.5
+    MaxValue: 128
+    Default: 0.5
+
+  # Provisioned Parameters
+  DBInstanceClass:
+    Description: '[Provisioned only] Database instance class (e.g., db.r6g.large, db.r5.xlarge)'
+    Type: String
+    Default: db.r6g.large
+    AllowedValues:
+      - db.t3.medium
+      - db.t3.large
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+      - db.r6i.large
+      - db.r6i.xlarge
+      - db.r6i.2xlarge
+
+  NumberOfInstances:
+    Description: '[Provisioned only] Number of DB instances (1 for single-AZ, 2+ for multi-AZ)'
+    Type: Number
+    MinValue: 1
+    MaxValue: 5
+    Default: 2
+
+  DBBackupRetentionPeriod:
+    Description: 'The number of days to keep snapshots of the cluster.'
+    Type: Number
+    MinValue: 1
+    MaxValue: 35
+    Default: 30
+
+  PreferredBackupWindow:
+    Description: 'The daily time range in UTC during which you want to create automated backups.'
+    Type: String
+    Default: '09:54-10:24'
+
+  PreferredMaintenanceWindow:
+    Description: 'The weekly time range (in UTC) during which system maintenance can occur.'
+    Type: String
+    Default: 'sat:07:00-sat:07:30'
+
+  EnableDeletionProtection:
+    Description: 'Enable deletion protection for the cluster (recommended for production)'
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+
+  EnablePerformanceInsights:
+    Description: 'Enable Performance Insights for monitoring'
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+
+  PerformanceInsightsRetentionPeriod:
+    Description: 'Performance Insights retention period in days'
+    Type: Number
+    AllowedValues: [7, 731]
+    Default: 7
+
+Conditions:
+  EnablePICondition: !Equals [!Ref EnablePerformanceInsights, 'true']
+  IsServerless: !Equals [!Ref DeploymentMode, 'Serverless']
+  IsProvisioned: !Equals [!Ref DeploymentMode, 'Provisioned']
+  # Instance 2 is created for: Serverless (always 2), or Provisioned with 2+ instances
+  CreateInstance2: !Or
+    - !Equals [!Ref DeploymentMode, 'Serverless']
+    - !And
+      - !Equals [!Ref DeploymentMode, 'Provisioned']
+      - !Not [!Equals [!Ref NumberOfInstances, 1]]
+  # Instances 3-5 are Provisioned only
+  CreateInstance3: !And
+    - !Equals [!Ref DeploymentMode, 'Provisioned']
+    - !Or
+      - !Equals [!Ref NumberOfInstances, 3]
+      - !Equals [!Ref NumberOfInstances, 4]
+      - !Equals [!Ref NumberOfInstances, 5]
+  CreateInstance4: !And
+    - !Equals [!Ref DeploymentMode, 'Provisioned']
+    - !Or
+      - !Equals [!Ref NumberOfInstances, 4]
+      - !Equals [!Ref NumberOfInstances, 5]
+  CreateInstance5: !And
+    - !Equals [!Ref DeploymentMode, 'Provisioned']
+    - !Equals [!Ref NumberOfInstances, 5]
+
+Resources:
+
+  # KMS Key for RDS encryption (customer-managed key for better control)
+  RDSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${AWS::StackName} RDS encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow RDS to use the key
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-RDSEncryptionKey'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  RDSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub
+        - 'alias/${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-rds'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      TargetKeyId: !Ref RDSEncryptionKey
+
+  RdsCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-rds-credentials'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]  # get first part of ProjectId [UUID] (ProjectIdPrefix)
+      Description: 'RDS credentials for database'
+      KmsKeyId: !Ref RDSEncryptionKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"DB_USER": "${DBMasterUsername}", "DB_NAME": "${DBName}", "DB_HOST": "", "DB_PORT": "5432", "username": "${DBMasterUsername}", "dbname": "${DBName}", "host": "", "port": "5432", "DB_PASS": ""}'
+        GenerateStringKey: 'password'
+        ExcludePunctuation: true
+        IncludeSpace: false
+        PasswordLength: 30
+      Tags:
+        - Key: Name
+          Value: !Sub
+            - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-rds-credentials'
+            - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]  # get first part of ProjectId [UUID] (ProjectIdPrefix)
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  SecretTargetAttachment:
+    Type: 'AWS::SecretsManager::SecretTargetAttachment'
+    Properties:
+      TargetId: !Ref DBCluster
+      SecretId: !Ref RdsCredentialsSecret
+      TargetType: 'AWS::RDS::DBCluster'
+
+  RDSClusterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      # Ingress Rules defined in client side stack on related SecurityGroup creation, `lambda-app-stack.cfn.yaml`
+      VpcId: {"Fn::ImportValue": !Join ["-", [!Ref ProjectPrefix, !Select [0, !Split ['-', !Ref ProjectId]], !Ref StageName, 'vpc-stack-VPCID']]}
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ClusterSecurityGroup'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  DBMonitoringRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBMonitoringRole'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  DBClusterParameterGroup:
+    Type: 'AWS::RDS::DBClusterParameterGroup'
+    Properties:
+      Description: !Ref 'AWS::StackName'
+      Family: aurora-postgresql17
+      Parameters:
+        client_encoding: 'UTF8'
+        rds.force_ssl: 1
+        log_connections: 1
+        log_line_prefix: '%t:%r:%u@%d:[%p]:'
+        shared_preload_libraries: 'pg_stat_statements'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBClusterParameterGroup'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  DBCluster:
+    DependsOn: 'RdsCredentialsSecret'
+    DeletionPolicy: Snapshot # default
+    UpdateReplacePolicy: Snapshot
+    Type: 'AWS::RDS::DBCluster'
+    Properties:
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      DatabaseName: !Ref DBName
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      DBSubnetGroupName: {"Fn::ImportValue": !Join ["-", [!Ref ProjectPrefix, !Select [0, !Split ['-', !Ref ProjectId]], !Ref StageName, 'vpc-stack-RDSDBSubnetGroupName']]}
+      DeletionProtection: !Ref EnableDeletionProtection
+      EnableCloudwatchLogsExports:
+        - postgresql
+      EnableHttpEndpoint: false
+      EnableIAMDatabaseAuthentication: true  # Enable IAM authentication
+      Engine: aurora-postgresql
+      EngineMode: provisioned  # Both Serverless V2 and Provisioned use "provisioned"
+      EngineVersion: 17.4
+      KmsKeyId: !GetAtt RDSEncryptionKey.Arn  # Use customer-managed KMS key
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RdsCredentialsSecret}:SecretString:password}}'  # Get password from SecretsManager
+      Port: 5432
+      PreferredBackupWindow: !Ref PreferredBackupWindow
+      PreferredMaintenanceWindow: !Ref PreferredMaintenanceWindow
+      ServerlessV2ScalingConfiguration: !If
+        - IsServerless
+        - MaxCapacity: !Ref MaxCapacity
+          MinCapacity: !Ref MinCapacity
+        - !Ref 'AWS::NoValue'
+      SnapshotIdentifier: !Ref 'AWS::NoValue'
+      StorageEncrypted: true
+      VpcSecurityGroupIds:
+      - !Ref RDSClusterSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBCluster'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+        - Key: DeploymentMode
+          Value: !Ref DeploymentMode
+
+  # DB Instance 1 (always created for both Serverless and Provisioned)
+  DBInstance1:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBInstanceClass: !If [IsServerless, 'db.serverless', !Ref DBInstanceClass]
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePICondition, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      PromotionTier: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBInstance1'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  # DB Instance 2 (created for Serverless with 2 instances, or Provisioned with 2+ instances)
+  DBInstance2:
+    Type: 'AWS::RDS::DBInstance'
+    Condition: CreateInstance2
+    Properties:
+      DBInstanceClass: !If [IsServerless, 'db.serverless', !Ref DBInstanceClass]
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePICondition, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      PromotionTier: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBInstance2'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  # DB Instance 3 (Provisioned only, if NumberOfInstances >= 3)
+  DBInstance3:
+    Type: 'AWS::RDS::DBInstance'
+    Condition: CreateInstance3
+    Properties:
+      DBInstanceClass: !Ref DBInstanceClass
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePICondition, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      PromotionTier: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBInstance3'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  # DB Instance 4 (Provisioned only, if NumberOfInstances >= 4)
+  DBInstance4:
+    Type: 'AWS::RDS::DBInstance'
+    Condition: CreateInstance4
+    Properties:
+      DBInstanceClass: !Ref DBInstanceClass
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePICondition, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      PromotionTier: 4
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBInstance4'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+  # DB Instance 5 (Provisioned only, if NumberOfInstances = 5)
+  DBInstance5:
+    Type: 'AWS::RDS::DBInstance'
+    Condition: CreateInstance5
+    Properties:
+      DBInstanceClass: !Ref DBInstanceClass
+      DBClusterIdentifier: !Ref DBCluster
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePICondition, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      PromotionTier: 5
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DBInstance5'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+
+Outputs:
+  StackName:
+    Description: 'RDS Stack name'
+    Value: !Sub '${AWS::StackName}'
+
+  DeploymentMode:
+    Description: 'RDS deployment mode (Serverless or Provisioned)'
+    Value: !Ref DeploymentMode
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentMode'
+
+  ClusterName:
+    Description: 'The name of the cluster'
+    Value: !Ref DBCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  DNSName:
+    Description: 'The connection endpoint for the DB cluster'
+    Value: !GetAtt 'DBCluster.Endpoint.Address'
+    Export:
+      Name: !Sub '${AWS::StackName}-DNSName'
+
+  ReaderEndpoint:
+    Description: 'The reader endpoint for the DB cluster (load-balanced across read replicas)'
+    Value: !GetAtt 'DBCluster.ReadEndpoint.Address'
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderEndpoint'
+
+  Port:
+    Description: 'The database port'
+    Value: !GetAtt 'DBCluster.Endpoint.Port'
+    Export:
+      Name: !Sub '${AWS::StackName}-Port'
+
+  SecurityGroupId:
+    Description: 'The security group used to manage access to RDS Aurora PostgreSQL'
+    Value: !Ref RDSClusterSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSClusterSecurityGroup'
+
+  RdsCredentialsSecretArn:
+    Description: 'ARN of the Secrets Manager secret containing RDS credentials'
+    Value: !Ref RdsCredentialsSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-RdsCredentialsSecretArn'
+
+  RDSEncryptionKeyArn:
+    Description: 'ARN of the KMS key used for RDS encryption'
+    Value: !GetAtt RDSEncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSEncryptionKeyArn'
+
+  RDSEncryptionKeyId:
+    Description: 'ID of the KMS key used for RDS encryption'
+    Value: !Ref RDSEncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSEncryptionKeyId'
+
+  NumberOfInstances:
+    Description: 'Number of DB instances in the cluster'
+    Value: !If [IsServerless, 2, !Ref NumberOfInstances]
+    Export:
+      Name: !Sub '${AWS::StackName}-NumberOfInstances'

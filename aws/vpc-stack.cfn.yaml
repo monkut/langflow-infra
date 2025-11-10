@@ -1,0 +1,530 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC: public and private subnets in two availability zones (StackName expected to be in the format: <ProjectPrefix>-<ProjectId-Prefix>-<StageName>-vpc-stack)'
+
+
+Parameters:
+
+  ProjectPrefix:
+    Description: 'Project prefix for resource names (without hyphen or StageName)'
+    Type: String
+    MinLength: 3
+    MaxLength: 10
+
+  ProjectId:
+    Description: 'A project specific UUID (ex: 317523a7-9837-41a5-9757-f83c7987e1c7)'
+    Type: String
+    MinLength: 36 # UUID str length
+
+  StageName:
+    Type: String
+    AllowedValues:
+    - prd
+    - dev
+    - stg
+
+  ClassBNetwork:
+    Description: 'Class B of VPC (10.XXX.0.0/16)'
+    ConstraintDescription: 'Must be in the range [0-254]'
+    Type: Number
+    MinValue: 0
+    MaxValue: 254
+    Default: 0
+
+  UseNATGateway:
+    Description: 'Use NAT Gateway for private subnets'
+    Type: String
+    AllowedValues:
+    - true
+    - false
+    Default: false
+
+  NATEIPAZ0AllocationId:
+    Description: '(Optional) NAT EIP AllocationId for AZ0'
+    Type: String
+    Default: ""
+
+  NATEIPAZ1AllocationId:
+    Description: '(Optional) NAT EIP AllocationId for AZ1'
+    Type: String
+    Default: ""
+
+Conditions:
+  UseNatGW: !Equals [!Ref UseNATGateway, 'true']
+  CreateEIPs:
+    Fn::Not: [!And [ !Not [ !Equals [ !Ref NATEIPAZ0AllocationId, "" ]], !Not [ !Equals [ !Ref NATEIPAZ1AllocationId, "" ]], !Equals [!Ref UseNATGateway, 'true'] ]]
+
+Resources:
+
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Sub '10.${ClassBNetwork}.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-VPC'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  # subnet AZ-0 definition
+  SubnetAZ0Public:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']  # selects the first AZ from the current region's AZ list.
+      CidrBlock: !Sub '10.${ClassBNetwork}.128.0/20'
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-SubnetAZ0Public'
+      - Key: Reach
+        Value: public
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  SubnetAZ0Private:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']  # selects the first AZ from the current region's AZ list.
+      CidrBlock: !Sub '10.${ClassBNetwork}.192.0/21'
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-SubnetAZ0Private'
+      - Key: Reach
+        Value: private
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  # subnet AZ-1 definition
+  SubnetAZ1Public:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']  # selects the first AZ from the current region's AZ list.
+      CidrBlock: !Sub '10.${ClassBNetwork}.144.0/20'
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-SubnetAZ1Public'
+      - Key: Reach
+        Value: public
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  SubnetAZ1Private:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']  # selects the first AZ from the current region's AZ list.
+      CidrBlock: !Sub '10.${ClassBNetwork}.200.0/21'
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-SubnetAZ1Private'
+      - Key: Reach
+        Value: private
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  # route table AZ0 definition and association
+  RouteTableAZ0Public:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-RouteTableAZ0Public'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  RouteTableAZ0Private:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-RouteTableAZ0Private'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  RouteTableAssociationAZ0Public:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ0Public
+      RouteTableId: !Ref RouteTableAZ0Public
+
+  RouteTableAssociationAZ0Private:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ0Private
+      RouteTableId: !Ref RouteTableAZ0Private
+
+  # route table AZ1 definition and association
+  RouteTableAZ1Public:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-RouteTableAZ1Public'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  RouteTableAZ1Private:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-RouteTableAZ1Private'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  RouteTableAssociationAZ1Public:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ1Public
+      RouteTableId: !Ref RouteTableAZ1Public
+
+  RouteTableAssociationAZ1Private:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ1Private
+      RouteTableId: !Ref RouteTableAZ1Private
+
+  # NetworkACL (network access control lists) definition
+  NetworkAclPublic:
+    Type: 'AWS::EC2::NetworkAcl'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-NetworkAclPublic'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  NetworkAclPrivate:
+    Type: 'AWS::EC2::NetworkAcl'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-NetworkAclPrivate'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  # NetworkACL (network access control lists) association
+  SubnetNetworkAclAssociationAZ0Public:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ0Public
+      NetworkAclId: !Ref NetworkAclPublic
+
+  SubnetNetworkAclAssociationAZ0Private:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ0Private
+      NetworkAclId: !Ref NetworkAclPrivate
+
+  SubnetNetworkAclAssociationAZ1Public:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ1Public
+      NetworkAclId: !Ref NetworkAclPublic
+
+  SubnetNetworkAclAssociationAZ1Private:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAZ1Private
+      NetworkAclId: !Ref NetworkAclPrivate
+
+  NetworkAclEntryInPublicAllowAll:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: '0.0.0.0/0'
+
+  NetworkAclEntryOutPublicAllowAll:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: '0.0.0.0/0'
+
+  NetworkAclEntryInPrivateAllowVPC:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: '0.0.0.0/0'
+
+  NetworkAclEntryOutPrivateAllowVPC:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: '0.0.0.0/0'
+
+  # For multi-AZ replication/failover Support an RDS requires at least 2 subnets,
+  # to support multi-AZ replication/failover requires that at least 2 AZs are available for the RDS to use.
+  # -- Best Practice: Create a DBSubnetGroup with at least 2 subnets in different AZs. in the VPC stack
+  RDSSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: 'Subnets for RDS db instance'
+      SubnetIds: [ !Ref SubnetAZ0Private, !Ref SubnetAZ1Private ]
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-RDSSubnetGroup'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-InternetGateway'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  VPCGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatEIPAZ0:
+    DependsOn: 'VPCGatewayAttachment'
+    Type: 'AWS::EC2::EIP'
+    Condition: CreateEIPs
+    Properties:
+      Domain: 'vpc'
+
+  NatEIPAZ1:
+    DependsOn: 'VPCGatewayAttachment'
+    Type: 'AWS::EC2::EIP'
+    Condition: CreateEIPs
+    Properties:
+      Domain: 'vpc'
+
+  NatGatewayAZ0:
+    DependsOn: 'VPCGatewayAttachment'
+    Condition: UseNatGW
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !If [CreateEIPs, !GetAtt NatEIPAZ0.AllocationId, !Ref NATEIPAZ0AllocationId]
+      SubnetId: !Ref SubnetAZ0Public
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-NatGatewayAZ0'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  NatGatewayAZ1:
+    DependsOn: 'VPCGatewayAttachment'
+    Condition: UseNatGW
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !If [CreateEIPs, !GetAtt NatEIPAZ1.AllocationId, !Ref NATEIPAZ1AllocationId]
+      SubnetId: !Ref SubnetAZ1Public
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-NatGatewayAZ1'
+      - Key: ProjectId
+        Value: !Ref ProjectId
+
+  RouteTableAZ0PrivateNatGateway:
+    Type: 'AWS::EC2::Route'
+    Condition: UseNatGW
+    DependsOn: 'VPCGatewayAttachment'
+    Properties:
+      RouteTableId: !Ref RouteTableAZ0Private
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGatewayAZ0
+
+  RouteTableAZ1PrivateNatGateway:
+    Condition: UseNatGW
+    Type: 'AWS::EC2::Route'
+    DependsOn: 'VPCGatewayAttachment'
+    Properties:
+      RouteTableId: !Ref RouteTableAZ1Private
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGatewayAZ1
+
+  RouteTableAZ0PublicInternetRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTableAZ0Public
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  RouteTableAZ1PublicInternetRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTableAZ1Public
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+Outputs:
+
+  StageName:
+    Description:  'Stack stage name'
+    Value: !Ref StageName
+    Export:
+      Name: !Sub '${AWS::StackName}-StageName'
+
+  ClassBNetwork:
+    Description: 'Class B of VPC (10.XXX.0.0/16)'
+    Value: !Ref ClassBNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ClassBNetwork'
+
+  AZs:
+    Description: 'AZs'
+    Value: 2
+    Export:
+      Name: !Sub '${AWS::StackName}-AZs'
+
+  AZ0:
+    Description: 'AZ of 0'
+    Value: !Select [0, !GetAZs '']  # selects the first AZ from the current region's AZ list.
+    Export:
+      Name: !Sub '${AWS::StackName}-AZ0'
+
+  AZ1:
+    Description: 'AZ of 1'
+    Value: !Select [1, !GetAZs '']  # selects the first AZ from the current region's AZ list.
+    Export:
+      Name: !Sub '${AWS::StackName}-AZ1'
+
+  VPC:
+    Description: 'VPC.ID'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  VPCCidrBlock:
+    Description: 'VPC.CidrBlock'
+    Value: !Sub '10.${ClassBNetwork}.0.0/16'
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCCidrBlock'
+
+  SubnetsPublic:
+    Description: 'Subnets public.'
+    Value: !Join [',', [!Ref SubnetAZ0Public, !Ref SubnetAZ1Public]]
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetsPublic'
+
+  SubnetsPrivate:
+    Description: 'Subnets private.'
+    Value: !Join [',', [!Ref SubnetAZ0Private, !Ref SubnetAZ1Private]]
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetsPrivate'
+
+  RouteTablesPrivate:
+    Description: 'Route tables private.'
+    Value: !Join [',', [!Ref RouteTableAZ0Private, !Ref RouteTableAZ1Private]]
+    Export:
+      Name: !Sub '${AWS::StackName}-RouteTablesPrivate'
+
+  RouteTablesPublic:
+    Description: 'Route tables public.'
+    Value: !Join [',', [!Ref RouteTableAZ0Public, !Ref RouteTableAZ1Public]]
+    Export:
+      Name: !Sub '${AWS::StackName}-RouteTablesPublic'
+
+  SubnetAZ0Public:
+    Description: 'SubnetAZ0Public'
+    Value: !Ref SubnetAZ0Public
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ0Public'
+
+  SubnetAZ0PublicCidrBlock:
+    Description: 'SubnetAZ0PublicCidrBlock'
+    Value: !Sub '10.${ClassBNetwork}.128.0/20'
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ0PublicCidrBlock'
+
+  RouteTableAZ0Public:
+    Description: 'RouteTableAZ0Public'
+    Value: !Ref RouteTableAZ0Public
+    Export:
+      Name: !Sub '${AWS::StackName}-RouteTableAZ0Public'
+
+  SubnetAZ0PrivateExport:
+    Description: 'SubnetAZ0Private'
+    Value: !Ref SubnetAZ0Private
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ0Private'
+
+  SubnetAZ0PrivateCidrBlock:
+    Description: 'SubnetAZ0PrivateCidrBlock'
+    Value: !Sub '10.${ClassBNetwork}.192.0/21'
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ0PrivateCidrBlock'
+
+  RouteTableAZ0Private:
+    Description: 'RouteTableAZ0Private'
+    Value: !Ref RouteTableAZ0Private
+    Export:
+      Name: !Sub '${AWS::StackName}-RouteTableAZ0Private'
+
+  SubnetAZ1Public:
+    Description: 'SubnetAZ1Public'
+    Value: !Ref SubnetAZ1Public
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ1Public'
+
+  SubnetAZ1PublicCidrBlock:
+    Description: 'SubnetAZ1PublicCidrBlock'
+    Value: !Sub '10.${ClassBNetwork}.144.0/20'
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ1PublicCidrBlock'
+
+  RouteTableAZ1Public:
+    Description: 'RouteTableAZ1Public'
+    Value: !Ref RouteTableAZ1Public
+    Export:
+      Name: !Sub '${AWS::StackName}-RouteTableAZ1Public'
+
+  SubnetAZ1PrivateExport:
+    Description: 'SubnetAZ1Private'
+    Value: !Ref SubnetAZ1Private
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ1Private'
+
+  SubnetAZ1PrivateCidrBlock:
+    Description: 'SubnetAZ1PrivateCidrBlock'
+    Value: !Sub '10.${ClassBNetwork}.200.0/21'
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetAZ1PrivateCidrBlock'
+
+  RouteTableAZ1Private:
+    Description: 'RouteTableAZ1Private'
+    Value: !Ref RouteTableAZ1Private
+    Export:
+      Name: !Sub '${AWS::StackName}-RouteTableAZ1Private'
+
+  RDSSubnetGroupNameExport:
+    Description: 'RDS DBSubnetGroupName'
+    Value: !Ref RDSSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSDBSubnetGroupName'

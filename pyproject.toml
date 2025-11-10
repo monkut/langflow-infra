@@ -1,0 +1,32 @@
+[project]
+name = "langflow-infra-tools"
+version = "1.0.0"
+description = "Infrastructure tools for langflow AWS deployment"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+generate-dockerfile = "infra_tools.dockerfile_generator:main"
+setup-deployment-tasks = "infra_tools.setup_deployment:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["infra_tools"]
+
+[tool.poe.tasks]
+help = "Display available commands"
+
+[tool.poe.tasks.deploy-dummy]
+help = "Build and deploy placeholder app to Fargate"
+shell = """
+cd dummy-app
+docker build -t placeholder-app:latest .
+ECR_URI=$(aws cloudformation describe-stacks --stack-name langflow-*-platform-stack --query 'Stacks[0].Outputs[?OutputKey==`FargateECRRepositoryUri`].OutputValue' --output text)
+aws ecr get-login-password --region ${AWS_REGION:-ap-northeast-1} | docker login --username AWS --password-stdin $ECR_URI
+docker tag placeholder-app:latest $ECR_URI:placeholder
+docker push $ECR_URI:placeholder
+echo "Placeholder app deployed to: $ECR_URI:placeholder"
+"""

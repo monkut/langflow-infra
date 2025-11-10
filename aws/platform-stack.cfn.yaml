@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Platform: Shared services including ECR repositories and S3 buckets (StackName expected to be in the format: <ProjectPrefix>-<ProjectId-Prefix>-<StageName>-platform-stack)'
+
+Parameters:
+
+  ProjectPrefix:
+    Description: 'Project prefix for resource names (without hyphen or StageName)'
+    Type: String
+    MinLength: 3
+    MaxLength: 10
+
+  ProjectId:
+    Description: 'A project specific UUID (ex: 317523a7-9837-41a5-9757-f83c7987e1c7)'
+    Type: String
+    MinLength: 36
+
+  StageName:
+    Type: String
+    AllowedValues:
+      - prd
+      - dev
+      - stg
+
+  CreateLambdaECR:
+    Description: 'Create ECR repository for Lambda container images'
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateFargateECR:
+    Description: 'Create ECR repository for Fargate container images'
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateLambdaSourceBucket:
+    Description: 'Create S3 bucket for Lambda source code'
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ECRImageRetentionCount:
+    Description: 'Number of container images to retain in ECR repositories'
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+Conditions:
+  CreateLambdaECRRepo: !Equals [!Ref CreateLambdaECR, 'true']
+  CreateFargateECRRepo: !Equals [!Ref CreateFargateECR, 'true']
+  CreateLambdaBucket: !Equals [!Ref CreateLambdaSourceBucket, 'true']
+
+Resources:
+
+  # S3 Bucket for Lambda source code
+  # This bucket stores Lambda function source code (zip files)
+  AppSourceS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLambdaBucket
+    Properties:
+      BucketName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-appsrc'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-AppSourceBucket'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'Lambda source code storage'
+
+  # ECR Repository for Lambda container images
+  # This repository stores container images for Lambda functions
+  ApiLambdaECRRepository:
+    Type: AWS::ECR::Repository
+    Condition: CreateLambdaECRRepo
+    Properties:
+      RepositoryName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-lambda-ecr'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last ${ECRImageRetentionCount} images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ECRImageRetentionCount}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Lambda-ECR'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'Lambda container images'
+
+  # ECR Repository for Fargate container images
+  # This repository stores container images for ECS Fargate applications
+  FargateECRRepository:
+    Type: AWS::ECR::Repository
+    Condition: CreateFargateECRRepo
+    Properties:
+      RepositoryName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-ecr'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last ${ECRImageRetentionCount} images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ECRImageRetentionCount}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Fargate-ECR'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'Fargate container images'
+
+Outputs:
+
+  StageName:
+    Description: 'Stack stage name'
+    Value: !Ref StageName
+    Export:
+      Name: !Sub '${AWS::StackName}-StageName'
+
+  ProjectIdPrefix:
+    Description: 'First segment of Project ID'
+    Value: !Select [0, !Split ['-', !Ref ProjectId]]
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectIdPrefix'
+
+  # S3 Bucket Outputs
+  AppSourceS3Bucket:
+    Condition: CreateLambdaBucket
+    Description: 'S3 bucket for Lambda application source code'
+    Value: !Ref AppSourceS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSourceS3Bucket'
+
+  AppSourceS3BucketArn:
+    Condition: CreateLambdaBucket
+    Description: 'ARN of S3 bucket for Lambda application source code'
+    Value: !GetAtt AppSourceS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSourceS3BucketArn'
+
+  # Lambda ECR Outputs
+  ApiLambdaECRRepository:
+    Condition: CreateLambdaECRRepo
+    Description: 'ECR Repository name for Lambda container images'
+    Value: !Ref ApiLambdaECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiLambdaECRRepository'
+
+  ApiLambdaECRRepositoryArn:
+    Condition: CreateLambdaECRRepo
+    Description: 'ARN of ECR Repository for Lambda container images'
+    Value: !GetAtt ApiLambdaECRRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiLambdaECRRepositoryArn'
+
+  ApiLambdaECRRepositoryUri:
+    Condition: CreateLambdaECRRepo
+    Description: 'URI of ECR Repository for Lambda container images'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ApiLambdaECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiLambdaECRRepositoryUri'
+
+  # Fargate ECR Outputs
+  FargateECRRepository:
+    Condition: CreateFargateECRRepo
+    Description: 'ECR Repository name for Fargate container images'
+    Value: !Ref FargateECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateECRRepository'
+
+  FargateECRRepositoryArn:
+    Condition: CreateFargateECRRepo
+    Description: 'ARN of ECR Repository for Fargate container images'
+    Value: !GetAtt FargateECRRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateECRRepositoryArn'
+
+  FargateECRRepositoryUri:
+    Condition: CreateFargateECRRepo
+    Description: 'URI of ECR Repository for Fargate container images'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${FargateECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateECRRepositoryUri'
