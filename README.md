@@ -1,20 +1,15 @@
 # langflow-infra
 
-Contains all the boilerplate you need to create an AWS CloudFormation (CFN) infrastructure repository.
+CloudFormation infrastructure for multi-tenant Langflow deployment on AWS.
 
-## Infrastructure Pattern
+## Infrastructure Overview
 
-This repository was configured for: **vpc-rds-alb-fargate**
-
-### Pattern 2: VPC/RDS/ALB/Fargate
-
-This pattern provides a containerized application infrastructure using:
+This repository provides a production-ready containerized application infrastructure using:
 - VPC with public and private subnets
-- RDS Aurora PostgreSQL (serverless)
+- RDS Aurora PostgreSQL Serverless v2
 - ECS Fargate for container orchestration
 - Application Load Balancer (ALB) for traffic distribution
-- NAT Gateway for private subnet internet access
-- AWS WAF for application protection
+- NAT Gateway for private subnet internet access (optional)
 ## Prerequisites
 
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
@@ -37,7 +32,7 @@ This repository provides CloudFormation templates for:
 
 - **RDS Stack** (`aws/rds-stack.cfn.yaml`)
   - Aurora PostgreSQL Serverless v2 cluster
-  - Multi-AZ deployment with 2 instances
+  - Multi-AZ deployment with auto-scaling (0.5-4 ACU)
   - Secrets Manager integration for credentials
   - Performance Insights (optional)
   - Enhanced monitoring
@@ -110,19 +105,17 @@ aws cloudformation deploy \
 ### 2. Deploy RDS Stack
 
 The RDS stack creates:
-- Aurora PostgreSQL cluster (Serverless v2 or Provisioned)
-- DB instances for high availability
+- Aurora PostgreSQL Serverless v2 cluster
+- Multi-AZ deployment with auto-scaling capacity (0.5-4 ACU)
 - Secrets Manager secret for credentials
 - Customer-managed KMS encryption key
 - Security group for database access
 
-#### Option A: Serverless v2 (Variable Workloads)
-
 ```bash
-export DB_NAME=myappdb
+export DB_NAME=langflow
 export VPC_STACK_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack
 
-# Deploy RDS Serverless (Development)
+# Development deployment (lower cost, auto-pause disabled)
 aws cloudformation deploy \
     --template-file ./aws/rds-stack.cfn.yaml \
     --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
@@ -135,7 +128,8 @@ aws cloudformation deploy \
         DBName=${DB_NAME} \
         DBMasterUsername=postgres \
         MinCapacity=0.5 \
-        MaxCapacity=1 \
+        MaxCapacity=2 \
+        AutoPause=false \
         EnableDeletionProtection=false \
         EnablePerformanceInsights=false \
     --capabilities CAPABILITY_IAM \
@@ -143,7 +137,7 @@ aws cloudformation deploy \
         ProjectId=${PROJECT_ID} \
     --region ${AWS_REGION}
 
-# Deploy RDS Serverless (Production)
+# Production deployment (higher capacity, deletion protection)
 aws cloudformation deploy \
     --template-file ./aws/rds-stack.cfn.yaml \
     --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
@@ -157,55 +151,7 @@ aws cloudformation deploy \
         DBMasterUsername=postgres \
         MinCapacity=1 \
         MaxCapacity=4 \
-        EnableDeletionProtection=true \
-        EnablePerformanceInsights=true \
-    --capabilities CAPABILITY_IAM \
-    --tags \
-        ProjectId=${PROJECT_ID} \
-    --region ${AWS_REGION}
-```
-
-#### Option B: Provisioned (Steady Workloads)
-
-```bash
-export DB_NAME=myappdb
-export VPC_STACK_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack
-
-# Deploy RDS Provisioned (Development - Single Instance)
-aws cloudformation deploy \
-    --template-file ./aws/rds-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
-    --parameter-overrides \
-        ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=${PROJECT_ID} \
-        StageName=${STAGE} \
-        VpcStackName=${VPC_STACK_NAME} \
-        DeploymentMode=Provisioned \
-        DBName=${DB_NAME} \
-        DBMasterUsername=postgres \
-        DBInstanceClass=db.t4g.medium \
-        NumberOfInstances=1 \
-        EnableDeletionProtection=false \
-        EnablePerformanceInsights=false \
-    --capabilities CAPABILITY_IAM \
-    --tags \
-        ProjectId=${PROJECT_ID} \
-    --region ${AWS_REGION}
-
-# Deploy RDS Provisioned (Production - Multi-AZ with 2 instances)
-aws cloudformation deploy \
-    --template-file ./aws/rds-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
-    --parameter-overrides \
-        ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=${PROJECT_ID} \
-        StageName=${STAGE} \
-        VpcStackName=${VPC_STACK_NAME} \
-        DeploymentMode=Provisioned \
-        DBName=${DB_NAME} \
-        DBMasterUsername=postgres \
-        DBInstanceClass=db.r6g.large \
-        NumberOfInstances=2 \
+        AutoPause=false \
         EnableDeletionProtection=true \
         EnablePerformanceInsights=true \
     --capabilities CAPABILITY_IAM \
