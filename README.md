@@ -38,6 +38,14 @@ This repository provides CloudFormation templates for:
   - Enhanced monitoring
   - Automated backups
 
+- **S3 Storage Stack** (`aws/s3-stack.cfn.yaml`)
+  - S3 bucket for multi-tenant file storage
+  - Server-side encryption (AES256)
+  - Versioning enabled
+  - Lifecycle policies for old versions
+  - Public access blocked
+  - CORS configuration for web access
+
 ### Application Infrastructure
 - **Platform Stack** (`aws/platform-stack.cfn.yaml`)
   - ECR repository for container images
@@ -68,26 +76,13 @@ The VPC stack contains:
 
 ```bash
 export AWS_PROFILE={profile-name}
-export PROJECT_PREFIX=infra
+export PROJECT_PREFIX=mufglf 
 export PROJECT_ID={UUID} # e.g., 317523a7-9837-41a5-9757-f83c7987e1c7
 export STAGE=dev # (prd|stg|dev)
 export AWS_REGION=ap-northeast-1
 
-# Deploy VPC without NAT Gateway (lower cost)
-aws cloudformation deploy \
-    --template-file ./aws/vpc-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack \
-    --parameter-overrides \
-        ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=${PROJECT_ID} \
-        StageName=${STAGE} \
-        ClassBNetwork=10 \
-        UseNATGateway=false \
-    --tags \
-        ProjectId=${PROJECT_ID} \
-    --region ${AWS_REGION}
-
 # OR Deploy VPC with NAT Gateway (enables private subnet internet access)
+# -- need for external access, and user access
 aws cloudformation deploy \
     --template-file ./aws/vpc-stack.cfn.yaml \
     --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack \
@@ -160,7 +155,28 @@ aws cloudformation deploy \
     --region ${AWS_REGION}
 ```
 
-### 3. Deploy Fargate Application (Multi-Tenant Langflow)
+### 3. Deploy S3 Storage Stack (Optional for Multi-Tenant File Storage)
+
+The S3 stack creates a bucket for multi-tenant file storage with proper isolation and lifecycle management.
+
+> **Note**: This stack is **optional**. If you prefer local/ephemeral storage, skip this step. For production multi-tenant deployments with persistent file storage requirements, deploying this stack is recommended.
+
+```bash
+aws cloudformation deploy \
+    --template-file ./aws/s3-stack.cfn.yaml \
+    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-s3-stack \
+    --parameter-overrides \
+        ProjectPrefix=${PROJECT_PREFIX} \
+        ProjectId=$(echo $PROJECT_ID | cut -d'-' -f1) \
+        StageName=${STAGE} \
+    --tags \
+        ProjectId=${PROJECT_ID} \
+    --region ${AWS_REGION}
+```
+
+After deployment, the bucket name will be available for use in the Fargate stack configuration.
+
+### 4. Deploy Fargate Application (Multi-Tenant Langflow)
 
 The Fargate stack creates:
 - ECS Fargate cluster for long-running application
@@ -209,8 +225,15 @@ echo "ECR URI: ${ECR_URI}"
 aws ecr get-login-password --region ${AWS_REGION} | \
     docker login --username AWS --password-stdin ${ECR_URI}
 
-# Build Docker image (adjust path to your Dockerfile location)
-# For Langflow multi-tenant: cd to langflow repository root
+# Build Docker image using custom multi-tenant Dockerfile
+# This Dockerfile is located in the langflow-kiconia repository at:
+#   deploy/multi-tenant/Dockerfile
+# It contains:
+#   - Langflow application (from official build_and_push.Dockerfile)
+#   - tenantmgr.py helper script for tenant schema management
+#   - Production health checks and data directory setup
+# Build from langflow repository root:
+cd /path/to/langflow-kiconia
 docker build -f deploy/multi-tenant/Dockerfile -t langflow-multi-tenant:latest .
 
 # Tag and push image
@@ -327,15 +350,30 @@ aws cloudformation deploy \
     --region ${AWS_REGION}
 ```
 
-#### Step 6: Run Database Migrations
+#### Step 6: Initialize Multi-Tenant Database
 
-After deploying the Fargate stack, run database migrations to initialize the database schema:
+**Understanding Multi-Tenant Database Architecture:**
+
+This deployment uses PostgreSQL schema-based isolation for multi-tenancy:
+- **`public` schema**: Template only - created by migrations, never used by the application at runtime
+- **Tenant schemas** (e.g., `testcorp-abc123`): Working databases - used by the application to store actual tenant data
+
+**Why Two Steps?**
+1. **Migrations** create the table structures in `public` schema (the template)
+2. **`tenantmgr.py`** copies these structures to new tenant schemas (the working databases)
+
+This approach ensures:
+- Consistent schema structure across all tenants
+- Complete data isolation between tenants
+- Efficient schema creation (copy structure, not data)
+
+**Step 6a: Connect to ECS Container**
 
 ```bash
 # Get ECS cluster and service names
-export CLUSTER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-cluster
-export SERVICE_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-service
-export CONTAINER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-container
+export CLUSTER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-wbskt-cluster
+export SERVICE_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-wbskt-service
+export CONTAINER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-wbskt-container
 
 # Get running task ID
 export TASK_ID=$(aws ecs list-tasks \
@@ -347,7 +385,7 @@ export TASK_ID=$(aws ecs list-tasks \
 
 echo "Task ID: ${TASK_ID}"
 
-# Start interactive session
+# Start interactive session (requires AWS Session Manager plugin)
 aws ecs execute-command \
     --cluster ${CLUSTER_NAME} \
     --task ${TASK_ID} \
@@ -355,14 +393,64 @@ aws ecs execute-command \
     --command "/bin/bash" \
     --interactive \
     --region ${AWS_REGION}
-
-# Inside the container, run migrations
-cd /app
-LANGFLOW_DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:5432/${DB_NAME}" \
-    uv run alembic upgrade head
 ```
 
-> **Note**: For multi-tenant deployments, migrations create tables in the `public` schema. Tenant-specific schemas are created on-demand using `lfhelper.py` (see GROUP(SCHEMA)/USER Setup section).
+**Step 6b: Run Migrations (Inside Container)**
+
+This creates the template table structures in the `public` schema:
+
+```bash
+# Change to the directory containing alembic.ini
+cd /app/src/backend/base/langflow
+
+# Run migrations using alembic from the venv
+# Note: Use direct alembic command, not 'uv run alembic'
+alembic upgrade head
+```
+
+> **Note**: The `alembic` command uses the Python and libraries from `/app/.venv` which is already in the container's PATH.
+
+**Step 6c: Create First Tenant Schema (Inside Container)**
+
+This copies the template from `public` to a new tenant-specific schema:
+
+```bash
+# Activate the virtual environment first
+source /app/.venv/bin/activate
+
+# OR use the venv Python directly without activation
+# /app/.venv/bin/python /app/tenantmgr.py schema-add --prefix testcorp
+
+# Create tenant schema (copies table structure from public)
+python /app/tenantmgr.py schema-add --prefix testcorp
+
+# Output example:
+#    Creating new tenant schema: testcorp -> testcorp-a1b2c3
+#    ✓ Created PostgreSQL schema: testcorp-a1b2c3
+#    ✓ Initialized schema with 9 tables
+# ✅ Successfully created tenant schema:
+#    Prefix: testcorp
+#    Schema ID: testcorp-a1b2c3
+
+# Create admin user for the tenant (password auto-generated if not provided)
+python /app/tenantmgr.py user-add --schema testcorp-a1b2c3 --username admin@testcorp.com
+
+# Output example:
+# ✅ Successfully created user:
+#    Schema: testcorp-a1b2c3
+#    Username: admin@testcorp.com
+#    Password: Xy9kL2mP3qR4sT5v (auto-generated)
+#    User ID: 1
+
+# Exit the container
+exit
+```
+
+> **Important**:
+> - Activate the venv with `source /app/.venv/bin/activate` before running `tenantmgr.py`, or use the full path `/app/.venv/bin/python`
+> - Save the auto-generated password securely. It cannot be retrieved later, only reset using `user-reset`.
+> - The `tenantmgr.py` script uses synchronous database operations and requires `psycopg` (installed via the `postgresql` extra)
+> - The `public` schema is never accessed by the application at runtime. All application data is stored in tenant-specific schemas like `testcorp-a1b2c3`.
 
 #### Step 7: Get ALB DNS Name and Test
 
@@ -400,7 +488,7 @@ myapp-317523a7-dev-rds-stack
 
 ## GROUP(SCHEMA)/USER Setup
 
-For multi-tenant Langflow deployments, use `lfhelper.py` to manage tenant schemas and users. This utility is included in the Langflow multi-tenant Docker image.
+For multi-tenant Langflow deployments, use `tenantmgr.py` to manage tenant schemas and users. This utility is included in the Langflow multi-tenant Docker image.
 
 ### Prerequisites
 
@@ -428,24 +516,24 @@ The multi-tenant setup uses PostgreSQL schema-based isolation:
 - Complete data isolation between tenants
 - Access via tenant-specific URLs: `/tenant/{prefix}/`
 
-### Using lfhelper.py Locally
+### Using tenantmgr.py Locally
 
 When using docker-compose for local development:
 
 ```bash
 # Schema management
-docker exec langflow-multi-tenant python /app/lfhelper.py schema-add --prefix <tenant-prefix>
-docker exec langflow-multi-tenant python /app/lfhelper.py schema-list
+docker exec langflow-multi-tenant python /app/tenantmgr.py schema-add --prefix <tenant-prefix>
+docker exec langflow-multi-tenant python /app/tenantmgr.py schema-list
 
 # User management
-docker exec langflow-multi-tenant python /app/lfhelper.py user-add --schema <schema-id> --username <username> [--password <password>]
-docker exec langflow-multi-tenant python /app/lfhelper.py user-reset --schema <schema-id> --username <username> [--password <password>]
-docker exec langflow-multi-tenant python /app/lfhelper.py user-list --schema <schema-id>
+docker exec langflow-multi-tenant python /app/tenantmgr.py user-add --schema <schema-id> --username <username> [--password <password>]
+docker exec langflow-multi-tenant python /app/tenantmgr.py user-reset --schema <schema-id> --username <username> [--password <password>]
+docker exec langflow-multi-tenant python /app/tenantmgr.py user-list --schema <schema-id>
 ```
 
-### Using lfhelper.py on AWS Fargate
+### Using tenantmgr.py on AWS Fargate
 
-For AWS deployments, use ECS exec to run lfhelper.py commands inside the Fargate container:
+For AWS deployments, use ECS exec to run tenantmgr.py commands inside the Fargate container:
 
 #### Step 1: Get ECS Task ID
 
@@ -479,27 +567,27 @@ aws ecs execute-command \
     --region ${AWS_REGION}
 ```
 
-#### Step 3: Run lfhelper.py Commands
+#### Step 3: Run tenantmgr.py Commands
 
 Inside the ECS exec session:
 
 ```bash
 # Create tenant schemas
-python /app/lfhelper.py schema-add --prefix acmecorp
-python /app/lfhelper.py schema-add --prefix widgetco
+python /app/tenantmgr.py schema-add --prefix acmecorp
+python /app/tenantmgr.py schema-add --prefix widgetco
 
 # List all schemas
-python /app/lfhelper.py schema-list
+python /app/tenantmgr.py schema-list
 
 # Add users (password auto-generated if not provided)
-python /app/lfhelper.py user-add --schema acmecorp-a1b2c3 --username admin@acmecorp.com
-python /app/lfhelper.py user-add --schema acmecorp-a1b2c3 --username user@acmecorp.com --password MySecurePassword123
+python /app/tenantmgr.py user-add --schema acmecorp-a1b2c3 --username admin@acmecorp.com
+python /app/tenantmgr.py user-add --schema acmecorp-a1b2c3 --username user@acmecorp.com --password MySecurePassword123
 
 # List users in a schema
-python /app/lfhelper.py user-list --schema acmecorp-a1b2c3
+python /app/tenantmgr.py user-list --schema acmecorp-a1b2c3
 
 # Reset user password
-python /app/lfhelper.py user-reset --schema acmecorp-a1b2c3 --username admin@acmecorp.com
+python /app/tenantmgr.py user-reset --schema acmecorp-a1b2c3 --username admin@acmecorp.com
 
 # Exit the session
 exit
@@ -525,7 +613,7 @@ Example:
 - Username: `admin@acmecorp.com`
 - Password: `<auto-generated or specified>`
 
-### lfhelper.py Command Reference
+### tenantmgr.py Command Reference
 
 | Command | Description | Example |
 |---------|-------------|---------|

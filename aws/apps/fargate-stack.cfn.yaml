@@ -329,7 +329,7 @@ Resources:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: S3AccessPolicy
+        - PolicyName: FileStorageS3Policy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -340,14 +340,8 @@ Resources:
                   - s3:DeleteObject
                   - s3:ListBucket
                 Resource:
-                  - Fn::Sub:
-                    - 'arn:aws:s3:::${BucketName}'
-                    - BucketName:
-                        Fn::ImportValue: !Sub '${PlatformStackName}-AppSourceS3Bucket'
-                  - Fn::Sub:
-                    - 'arn:aws:s3:::${BucketName}/*'
-                    - BucketName:
-                        Fn::ImportValue: !Sub '${PlatformStackName}-AppSourceS3Bucket'
+                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${ProjectId}-${StageName}-files'
+                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${ProjectId}-${StageName}-files/*'
         - PolicyName: CloudWatchLogsPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -455,6 +449,13 @@ Resources:
               Value: '20'
             - Name: LANGFLOW_MAX_OVERFLOW
               Value: '30'
+            # S3 Storage Configuration
+            - Name: LANGFLOW_STORAGE_TYPE
+              Value: 's3'
+            - Name: LANGFLOW_S3_BUCKET_NAME
+              Value: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-files'
+            - Name: LANGFLOW_S3_REGION_NAME
+              Value: !Ref AWS::Region
           LinuxParameters:
             InitProcessEnabled: true
           LogConfiguration:
