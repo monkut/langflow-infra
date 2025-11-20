@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECR repository for Fargate container images (StackName format: <ProjectPrefix>-<ProjectId-Prefix>-<StageName>-ecr-stack)'
+
+Parameters:
+
+  ProjectPrefix:
+    Description: 'Project prefix for resource names (without hyphen or StageName)'
+    Type: String
+    MinLength: 3
+    MaxLength: 10
+
+  ProjectId:
+    Description: 'A project specific UUID (ex: 317523a7-9837-41a5-9757-f83c7987e1c7)'
+    Type: String
+    MinLength: 36
+
+  StageName:
+    Type: String
+    AllowedValues:
+      - prd
+      - dev
+      - stg
+
+  CreateFargateECR:
+    Description: 'Create ECR repository for Fargate container images'
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ECRImageRetentionCount:
+    Description: 'Number of container images to retain in ECR repositories'
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+Conditions:
+  CreateFargateECRRepo: !Equals [!Ref CreateFargateECR, 'true']
+
+Resources:
+
+  # ECR Repository for Fargate container images
+  # This repository stores container images for ECS Fargate applications
+  FargateECRRepository:
+    Type: AWS::ECR::Repository
+    Condition: CreateFargateECRRepo
+    Properties:
+      RepositoryName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-ecr'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last ${ECRImageRetentionCount} images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ECRImageRetentionCount}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Fargate-ECR'
+        - Key: ProjectId
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'Fargate container images'
+
+Outputs:
+
+  StageName:
+    Description: 'Stack stage name'
+    Value: !Ref StageName
+    Export:
+      Name: !Sub '${AWS::StackName}-StageName'
+
+  ProjectIdPrefix:
+    Description: 'First segment of Project ID'
+    Value: !Select [0, !Split ['-', !Ref ProjectId]]
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectIdPrefix'
+
+  # Fargate ECR Outputs
+  FargateECRRepository:
+    Condition: CreateFargateECRRepo
+    Description: 'ECR Repository name for Fargate container images'
+    Value: !Ref FargateECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateECRRepository'
+
+  FargateECRRepositoryArn:
+    Condition: CreateFargateECRRepo
+    Description: 'ARN of ECR Repository for Fargate container images'
+    Value: !GetAtt FargateECRRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateECRRepositoryArn'
+
+  FargateECRRepositoryUri:
+    Condition: CreateFargateECRRepo
+    Description: 'URI of ECR Repository for Fargate container images'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${FargateECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateECRRepositoryUri'

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Fargate WebSocket Service with Application Load Balancer'
+Description: 'Fargate application service with Application Load Balancer for Langflow multi-tenant deployment'
 
 Parameters:
 
@@ -12,8 +12,7 @@ Parameters:
   ProjectId:
     Description: 'A project specific UUID (ex: 123e4567-e89b-12d3-a456-426614174000)'
     Type: String
-    MinLength: 2
-    AllowedPattern: '^[a-z0-9-]+$'
+    MinLength: 36
 
   StageName:
     Description: 'Stage name (dev, stg, prd)'
@@ -26,10 +25,6 @@ Parameters:
 
   VpcStackName:
     Description: 'Name of the VPC stack to import values from'
-    Type: String
-
-  PlatformStackName:
-    Description: 'Name of the Platform stack to import values from (ECR, S3, etc.)'
     Type: String
 
   RdsStackName:
@@ -114,7 +109,7 @@ Parameters:
     Default: '/health/'
 
   CertificateArn:
-    Description: 'ACM Certificate ARN for HTTPS/WSS support (leave empty to create certificate)'
+    Description: 'ACM Certificate ARN for HTTPS support (required - leave empty to create certificate)'
     Type: String
     Default: ''
 
@@ -156,14 +151,6 @@ Parameters:
     MinValue: 1
     MaxValue: 10
 
-  UseWebSockets:
-    Description: 'Enable WebSocket-specific optimizations (sticky sessions, extended idle timeout)'
-    Type: String
-    Default: 'false'
-    AllowedValues:
-      - 'true'
-      - 'false'
-
 Conditions:
   # Certificate provided by user
   HasProvidedCertificate: !Not [!Equals [!Ref CertificateArn, '']]
@@ -178,7 +165,6 @@ Conditions:
     - !Condition CreateCertificate
   HasRdsStack: !Not [!Equals [!Ref RdsStackName, '']]
   EnableAutoScalingCondition: !Equals [!Ref EnableAutoScaling, 'true']
-  UseWebSocketsCondition: !Equals [!Ref UseWebSockets, 'true']
 
 Resources:
 
@@ -186,7 +172,9 @@ Resources:
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-cluster'
+      ClusterName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-cluster'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       CapacityProviders:
         - FARGATE
         - FARGATE_SPOT
@@ -206,8 +194,78 @@ Resources:
   CloudWatchLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/ecs/${ProjectPrefix}-${ProjectId}-${StageName}-wbskt'
+      LogGroupName: !Sub
+        - '/ecs/${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       RetentionInDays: !Ref LogRetentionDays
+
+  # S3 Bucket for file storage
+  FileStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-files'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Delete old versions after 30 days
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          # Abort incomplete multipart uploads after 7 days
+          - Id: AbortIncompleteMultipartUpload
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedHeaders:
+              - '*'
+            MaxAge: 3600
+      Tags:
+        - Key: ProjectId
+          Value: !Ref ProjectId
+        - Key: Stage
+          Value: !Ref StageName
+
+  # S3 Bucket policy - enforce SSL/TLS
+  FileStorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FileStorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Enforce SSL/TLS
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt FileStorageBucket.Arn
+              - !Sub '${FileStorageBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
 
   # ACM Certificate (if not provided)
   Certificate:
@@ -225,14 +283,18 @@ Resources:
         - Key: Stage
           Value: !Ref StageName
         - Key: Name
-          Value: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-cert'
+          Value: !Sub
+            - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-cert'
+            - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
 
   # Security Group for ALB
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-alb-sg'
-      GroupDescription: 'Security group for WebSocket ALB'
+      GroupName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-alb-sg'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      GroupDescription: 'Security group for application ALB'
       VpcId:
         Fn::ImportValue: !Sub '${VpcStackName}-VPCID'
       SecurityGroupIngress:
@@ -240,14 +302,17 @@ Resources:
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-          Description: 'Allow HTTP from anywhere'
+          Description: !If
+            - HasSSLCertificate
+            - 'Allow HTTP from anywhere (redirects to HTTPS)'
+            - 'Allow HTTP from anywhere'
         - !If
           - HasSSLCertificate
           - IpProtocol: tcp
             FromPort: 443
             ToPort: 443
             CidrIp: 0.0.0.0/0
-            Description: 'Allow HTTPS/WSS from anywhere'
+            Description: 'Allow HTTPS from anywhere'
           - !Ref AWS::NoValue
       SecurityGroupEgress:
         - IpProtocol: -1
@@ -263,8 +328,10 @@ Resources:
   ECSTaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-task-sg'
-      GroupDescription: 'Security group for WebSocket ECS tasks'
+      GroupName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-task-sg'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
+      GroupDescription: 'Security group for application ECS tasks'
       VpcId:
         Fn::ImportValue: !Sub '${VpcStackName}-VPCID'
       SecurityGroupIngress:
@@ -294,13 +361,15 @@ Resources:
       FromPort: 5432
       ToPort: 5432
       SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
-      Description: 'Allow WebSocket ECS tasks to access RDS'
+      Description: 'Allow application ECS tasks to access RDS'
 
   # IAM Execution Role (for ECS to pull images, write logs)
   ECSExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-exec-role'
+      RoleName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-exec-role'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -320,7 +389,9 @@ Resources:
   ECSTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-task-role'
+      RoleName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-task-role'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -340,8 +411,8 @@ Resources:
                   - s3:DeleteObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${ProjectId}-${StageName}-files'
-                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${ProjectId}-${StageName}-files/*'
+                  - !GetAtt FileStorageBucket.Arn
+                  - !Sub '${FileStorageBucket.Arn}/*'
         - PolicyName: CloudWatchLogsPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -390,7 +461,9 @@ Resources:
   ECSTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-task'
+      Family: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-task'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -399,7 +472,9 @@ Resources:
       ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
       TaskRoleArn: !GetAtt ECSTaskRole.Arn
       ContainerDefinitions:
-        - Name: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-container'
+        - Name: !Sub
+            - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-container'
+            - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
           Image: !Ref ContainerImage
           Essential: true
           PortMappings:
@@ -453,7 +528,7 @@ Resources:
             - Name: LANGFLOW_STORAGE_TYPE
               Value: 's3'
             - Name: LANGFLOW_S3_BUCKET_NAME
-              Value: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-files'
+              Value: !Ref FileStorageBucket
             - Name: LANGFLOW_S3_REGION_NAME
               Value: !Ref AWS::Region
           LinuxParameters:
@@ -474,7 +549,9 @@ Resources:
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-alb'
+      Name: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-alb'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       Type: application
       Scheme: internet-facing
       SecurityGroups:
@@ -492,7 +569,9 @@ Resources:
   ApplicationLoadBalancerTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-tg'
+      Name: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-tg'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       Port: !Ref ContainerPort
       Protocol: HTTP
       TargetType: ip
@@ -504,27 +583,16 @@ Resources:
       HealthCheckTimeoutSeconds: 5
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
-      TargetGroupAttributes: !If
-        - UseWebSocketsCondition
-        # WebSocket-specific attributes (sticky sessions + deregistration delay)
-        - - Key: stickiness.enabled
-            Value: 'true'
-          - Key: stickiness.type
-            Value: 'lb_cookie'
-          - Key: stickiness.lb_cookie.duration_seconds
-            Value: '86400'
-          - Key: deregistration_delay.timeout_seconds
-            Value: '30'
-        # Standard HTTP attributes (deregistration delay only)
-        - - Key: deregistration_delay.timeout_seconds
-            Value: '30'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
       Tags:
         - Key: ProjectId
           Value: !Ref ProjectId
         - Key: Stage
           Value: !Ref StageName
 
-  # ALB Listener for HTTP (redirects to HTTPS when certificate exists)
+  # ALB Listener for HTTP (redirects to HTTPS when SSL is enabled, otherwise forwards to target group)
   ApplicationLoadBalancerListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -545,7 +613,7 @@ Resources:
           - Type: forward
             TargetGroupArn: !Ref ApplicationLoadBalancerTargetGroup
 
-  # ALB Listener for HTTPS/WSS
+  # ALB Listener for HTTPS
   ApplicationLoadBalancerListenerHTTPS:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: HasSSLCertificate
@@ -567,7 +635,9 @@ Resources:
   ECSService:
     Type: AWS::ECS::Service
     Properties:
-      ServiceName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-service'
+      ServiceName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-service'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       Cluster: !Ref ECSCluster
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
@@ -582,7 +652,9 @@ Resources:
             - Fn::ImportValue: !Sub '${VpcStackName}-SubnetAZ1Private'
           AssignPublicIp: DISABLED
       LoadBalancers:
-        - ContainerName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-container'
+        - ContainerName: !Sub
+            - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-container'
+            - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
           ContainerPort: !Ref ContainerPort
           TargetGroupArn: !Ref ApplicationLoadBalancerTargetGroup
       HealthCheckGracePeriodSeconds: 180
@@ -617,7 +689,9 @@ Resources:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Condition: EnableAutoScalingCondition
     Properties:
-      PolicyName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-cpu-scaling'
+      PolicyName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-cpu-scaling'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref ServiceScalingTarget
       TargetTrackingScalingPolicyConfiguration:
@@ -632,7 +706,9 @@ Resources:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Condition: EnableAutoScalingCondition
     Properties:
-      PolicyName: !Sub '${ProjectPrefix}-${ProjectId}-${StageName}-wbskt-memory-scaling'
+      PolicyName: !Sub
+        - '${ProjectPrefix}-${ProjectIdPrefix}-${StageName}-app-memory-scaling'
+        - ProjectIdPrefix: !Select [0, !Split ['-', !Ref ProjectId]]
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref ServiceScalingTarget
       TargetTrackingScalingPolicyConfiguration:
@@ -645,13 +721,13 @@ Resources:
 Outputs:
 
   ECSCluster:
-    Description: 'ECS Cluster for WebSocket service'
+    Description: 'ECS Cluster for application service'
     Value: !Ref ECSCluster
     Export:
       Name: !Sub '${AWS::StackName}-ECSCluster'
 
   ECSService:
-    Description: 'ECS Service for WebSocket application'
+    Description: 'ECS Service for application'
     Value: !Ref ECSService
     Export:
       Name: !Sub '${AWS::StackName}-ECSService'
@@ -663,20 +739,20 @@ Outputs:
       Name: !Sub '${AWS::StackName}-ApplicationLoadBalancer'
 
   ApplicationLoadBalancerDNSName:
-    Description: 'ALB DNS Name for WebSocket connections'
+    Description: 'ALB DNS Name for application'
     Value: !GetAtt ApplicationLoadBalancer.DNSName
     Export:
       Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerDNSName'
 
   ApplicationLoadBalancerURL:
-    Description: 'ALB URL for WebSocket connections'
+    Description: 'ALB URL for application'
     Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
     Export:
       Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerURL'
 
   ApplicationLoadBalancerSecureURL:
     Condition: HasSSLCertificate
-    Description: 'ALB HTTPS/WSS URL for WebSocket connections'
+    Description: 'ALB HTTPS URL for application'
     Value: !Sub 'https://${ApplicationLoadBalancer.DNSName}'
     Export:
       Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerSecureURL'
@@ -708,3 +784,15 @@ Outputs:
       - !Ref Certificate
     Export:
       Name: !Sub '${AWS::StackName}-CertificateArn'
+
+  FileStorageBucketName:
+    Description: 'S3 bucket name for file storage'
+    Value: !Ref FileStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FileStorageBucketName'
+
+  FileStorageBucketArn:
+    Description: 'S3 bucket ARN for file storage'
+    Value: !GetAtt FileStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FileStorageBucketArn'

@@ -27,34 +27,23 @@ This repository provides CloudFormation templates for:
   - Internet Gateway for public subnets
   - Network ACLs
   - RDS Subnet Group
-  - S3 Bucket for Lambda source code
-  - ECR Repository for Lambda container images
 
 - **RDS Stack** (`aws/rds-stack.cfn.yaml`)
   - Aurora PostgreSQL Serverless v2 cluster
   - Multi-AZ deployment with auto-scaling (0.5-4 ACU)
   - Secrets Manager integration for credentials
-  - Performance Insights (optional)
   - Enhanced monitoring
   - Automated backups
 
-- **S3 Storage Stack** (`aws/s3-stack.cfn.yaml`)
-  - S3 bucket for multi-tenant file storage
-  - Server-side encryption (AES256)
-  - Versioning enabled
-  - Lifecycle policies for old versions
-  - Public access blocked
-  - CORS configuration for web access
-
 ### Application Infrastructure
-- **Platform Stack** (`aws/platform-stack.cfn.yaml`)
-  - ECR repository for container images
+- **ECR Stack** (`aws/ecr-stack.cfn.yaml`)
+  - ECR repository for Fargate container images
   - Image lifecycle policies
-  - Optional Lambda source S3 bucket (not used for Langflow)
 
 - **Fargate Application Stack** (`aws/apps/fargate-stack.cfn.yaml`)
   - ECS Fargate cluster for containerized applications
-  - Application Load Balancer with HTTP/HTTPS support
+  - Application Load Balancer with HTTPS support (HTTP redirects to HTTPS)
+  - S3 bucket for multi-tenant file storage
   - Auto-scaling based on CPU and memory
   - Container Insights and CloudWatch Logs
   - ECS Exec for interactive container access
@@ -68,7 +57,7 @@ The VPC stack contains:
 - VPC with configurable CIDR block
 - Public and private subnets in 2 AZs
 - Route tables and Network ACLs
-- Optional NAT Gateways for private subnet internet access
+- NAT Gateways for private subnet internet access
 - RDS Subnet Group for database deployment
 
 > **Important**: The stack name follows the pattern: `<ProjectPrefix>-<ProjectId-Prefix>-<StageName>-vpc-stack`
@@ -76,8 +65,9 @@ The VPC stack contains:
 
 ```bash
 export AWS_PROFILE={profile-name}
-export PROJECT_PREFIX=mufglf 
-export PROJECT_ID={UUID} # e.g., 317523a7-9837-41a5-9757-f83c7987e1c7
+export PROJECT_PREFIX=mufglf
+export PROJECT_ID=be1bbb25-e068-4e72-8392-a297feb9469c
+export PROJECT_ID_PREFIX=$(echo $PROJECT_ID | cut -d'-' -f1)
 export STAGE=dev # (prd|stg|dev)
 export AWS_REGION=ap-northeast-1
 
@@ -85,7 +75,7 @@ export AWS_REGION=ap-northeast-1
 # -- need for external access, and user access
 aws cloudformation deploy \
     --template-file ./aws/vpc-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-vpc-stack \
     --parameter-overrides \
         ProjectPrefix=${PROJECT_PREFIX} \
         ProjectId=${PROJECT_ID} \
@@ -108,12 +98,12 @@ The RDS stack creates:
 
 ```bash
 export DB_NAME=langflow
-export VPC_STACK_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack
+export VPC_STACK_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-vpc-stack
 
 # Development deployment (lower cost, auto-pause disabled)
 aws cloudformation deploy \
     --template-file ./aws/rds-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-rds-stack \
     --parameter-overrides \
         ProjectPrefix=${PROJECT_PREFIX} \
         ProjectId=${PROJECT_ID} \
@@ -132,76 +122,32 @@ aws cloudformation deploy \
         ProjectId=${PROJECT_ID} \
     --region ${AWS_REGION}
 
-# Production deployment (higher capacity, deletion protection)
-aws cloudformation deploy \
-    --template-file ./aws/rds-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
-    --parameter-overrides \
-        ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=${PROJECT_ID} \
-        StageName=${STAGE} \
-        VpcStackName=${VPC_STACK_NAME} \
-        DeploymentMode=Serverless \
-        DBName=${DB_NAME} \
-        DBMasterUsername=postgres \
-        MinCapacity=1 \
-        MaxCapacity=4 \
-        AutoPause=false \
-        EnableDeletionProtection=true \
-        EnablePerformanceInsights=true \
-    --capabilities CAPABILITY_IAM \
-    --tags \
-        ProjectId=${PROJECT_ID} \
-    --region ${AWS_REGION}
-```
 
-### 3. Deploy S3 Storage Stack (Optional for Multi-Tenant File Storage)
-
-The S3 stack creates a bucket for multi-tenant file storage with proper isolation and lifecycle management.
-
-> **Note**: This stack is **optional**. If you prefer local/ephemeral storage, skip this step. For production multi-tenant deployments with persistent file storage requirements, deploying this stack is recommended.
-
-```bash
-aws cloudformation deploy \
-    --template-file ./aws/s3-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-s3-stack \
-    --parameter-overrides \
-        ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=$(echo $PROJECT_ID | cut -d'-' -f1) \
-        StageName=${STAGE} \
-    --tags \
-        ProjectId=${PROJECT_ID} \
-    --region ${AWS_REGION}
-```
-
-After deployment, the bucket name will be available for use in the Fargate stack configuration.
-
-### 4. Deploy Fargate Application (Multi-Tenant Langflow)
+### 3. Deploy Fargate Application (Multi-Tenant Langflow)
 
 The Fargate stack creates:
 - ECS Fargate cluster for long-running application
-- Application Load Balancer (ALB) for internet-facing access
+- Application Load Balancer (ALB) with HTTPS support (HTTP redirects to HTTPS)
+- S3 bucket for multi-tenant file storage (encrypted, versioned, with lifecycle policies)
 - Auto-scaling based on CPU and memory
 - CloudWatch Logs and Container Insights
 - ECS Exec enabled for interactive container access
 
 > **Important**: This deployment requires building and pushing a container image to ECR first.
 
-#### Step 1: Deploy Platform Stack (ECR Repository)
+#### Step 1: Deploy ECR Stack
 
-The platform stack creates ECR repositories for your container images:
+The ECR stack creates an ECR repository for your Fargate container images:
 
 ```bash
 aws cloudformation deploy \
-    --template-file ./aws/platform-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-platform-stack \
+    --template-file ./aws/ecr-stack.cfn.yaml \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-ecr-stack \
     --parameter-overrides \
         ProjectPrefix=${PROJECT_PREFIX} \
         ProjectId=${PROJECT_ID} \
         StageName=${STAGE} \
         CreateFargateECR=true \
-        CreateLambdaECR=false \
-        CreateLambdaSourceBucket=false \
         ECRImageRetentionCount=10 \
     --capabilities CAPABILITY_IAM \
     --region ${AWS_REGION}
@@ -212,9 +158,9 @@ aws cloudformation deploy \
 Get the ECR repository URI and build/push your application image:
 
 ```bash
-# Get ECR repository URI from platform stack
+# Get ECR repository URI from ECR stack
 export ECR_URI=$(aws cloudformation describe-stacks \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-platform-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-ecr-stack \
     --query 'Stacks[0].Outputs[?OutputKey==`FargateECRRepositoryUri`].OutputValue' \
     --output text \
     --region ${AWS_REGION})
@@ -248,14 +194,14 @@ Retrieve database credentials from Secrets Manager:
 ```bash
 # Get RDS cluster endpoint
 export DB_HOST=$(aws cloudformation describe-stacks \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-rds-stack \
     --query 'Stacks[0].Outputs[?OutputKey==`DBClusterEndpoint`].OutputValue' \
     --output text \
     --region ${AWS_REGION})
 
 # Get secret ARN
 export SECRET_ARN=$(aws cloudformation describe-stacks \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-rds-stack \
     --query 'Stacks[0].Outputs[?OutputKey==`DBSecretArn`].OutputValue' \
     --output text \
     --region ${AWS_REGION})
@@ -277,20 +223,18 @@ export DB_NAME=langflow  # Database name used in RDS stack
 
 ```bash
 # Set stack names
-export VPC_STACK_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-vpc-stack
-export PLATFORM_STACK_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-platform-stack
-export RDS_STACK_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-rds-stack
+export VPC_STACK_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-vpc-stack
+export RDS_STACK_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-rds-stack
 
 # Deploy Fargate stack
 aws cloudformation deploy \
     --template-file ./aws/apps/fargate-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-fargate-stack \
     --parameter-overrides \
         ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=$(echo $PROJECT_ID | cut -d'-' -f1) \
+        ProjectId=${PROJECT_ID} \
         StageName=${STAGE} \
         VpcStackName=${VPC_STACK_NAME} \
-        PlatformStackName=${PLATFORM_STACK_NAME} \
         RdsStackName=${RDS_STACK_NAME} \
         ContainerImage=${ECR_URI}:latest \
         ContainerPort=7860 \
@@ -321,13 +265,12 @@ export CERTIFICATE_ARN=arn:aws:acm:${AWS_REGION}:${AWS_ACCOUNT_ID}:certificate/{
 # Deploy with auto-scaling and HTTPS
 aws cloudformation deploy \
     --template-file ./aws/apps/fargate-stack.cfn.yaml \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-fargate-stack \
     --parameter-overrides \
         ProjectPrefix=${PROJECT_PREFIX} \
-        ProjectId=$(echo $PROJECT_ID | cut -d'-' -f1) \
+        ProjectId=${PROJECT_ID} \
         StageName=${STAGE} \
         VpcStackName=${VPC_STACK_NAME} \
-        PlatformStackName=${PLATFORM_STACK_NAME} \
         RdsStackName=${RDS_STACK_NAME} \
         ContainerImage=${ECR_URI}:latest \
         ContainerPort=7860 \
@@ -371,9 +314,9 @@ This approach ensures:
 
 ```bash
 # Get ECS cluster and service names
-export CLUSTER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-wbskt-cluster
-export SERVICE_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-wbskt-service
-export CONTAINER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-wbskt-container
+export CLUSTER_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-app-cluster
+export SERVICE_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-app-service
+export CONTAINER_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-app-container
 
 # Get running task ID
 export TASK_ID=$(aws ecs list-tasks \
@@ -400,6 +343,10 @@ aws ecs execute-command \
 This creates the template table structures in the `public` schema:
 
 ```bash
+# enter the env
+cd /app
+source .venv/bin/activate
+
 # Change to the directory containing alembic.ini
 cd /app/src/backend/base/langflow
 
@@ -422,7 +369,7 @@ source /app/.venv/bin/activate
 # /app/.venv/bin/python /app/tenantmgr.py schema-add --prefix testcorp
 
 # Create tenant schema (copies table structure from public)
-python /app/tenantmgr.py schema-add --prefix testcorp
+python /app/tenantmgr.py `schema-add --prefix` testcorp
 
 # Output example:
 #    Creating new tenant schema: testcorp -> testcorp-a1b2c3
@@ -457,7 +404,7 @@ exit
 ```bash
 # Get the ALB DNS name
 export ALB_DNS=$(aws cloudformation describe-stacks \
-    --stack-name ${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-stack \
+    --stack-name ${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-fargate-stack \
     --query 'Stacks[0].Outputs[?OutputKey==`ApplicationLoadBalancerDNSName`].OutputValue' \
     --output text \
     --region ${AWS_REGION})
@@ -539,9 +486,9 @@ For AWS deployments, use ECS exec to run tenantmgr.py commands inside the Fargat
 
 ```bash
 # Set ECS resource names (should match your Fargate stack naming)
-export CLUSTER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-cluster
-export SERVICE_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-service
-export CONTAINER_NAME=${PROJECT_PREFIX}-$(echo $PROJECT_ID | cut -d'-' -f1)-${STAGE}-fargate-container
+export CLUSTER_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-app-cluster
+export SERVICE_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-app-service
+export CONTAINER_NAME=${PROJECT_PREFIX}-${PROJECT_ID_PREFIX}-${STAGE}-app-container
 
 # Get running task ID
 export TASK_ID=$(aws ecs list-tasks \

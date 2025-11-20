@@ -219,7 +219,7 @@ Resources:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
       GroupDescription: !Ref 'AWS::StackName'
-      # Ingress Rules defined in client side stack on related SecurityGroup creation, `lambda-app-stack.cfn.yaml`
+      # Ingress Rules defined in client side stack on related SecurityGroup creation, `fargate-stack.cfn.yaml`
       VpcId: {"Fn::ImportValue": !Join ["-", [!Ref ProjectPrefix, !Select [0, !Split ['-', !Ref ProjectId]], !Ref StageName, 'vpc-stack-VPCID']]}
       Tags:
         - Key: Name
